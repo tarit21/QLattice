@@ -1,0 +1,79 @@
+import streamlit as st
+import pandas as pd
+from utils.tasks_llm import summarize_text, compliance_check, classify_text, chatbot
+from utils.tasks_ml import train_classifier, train_regressor, predict
+from utils.rag_utils import build_vectorstore, query_rag
+
+st.set_page_config(page_title="Hackathon Super-App", layout="wide")
+
+st.title("🚀 Hackathon AI + ML Super-App")
+
+tab1, tab2, tab3 = st.tabs(["🤖 LLM Tasks", "📊 ML Playground", "📄 Doc Q&A"])
+
+# ---------------- Tab 1: LLM ----------------
+with tab1:
+    st.header("AI Copilot (Ollama)")
+    task = st.radio("Task:", ["Summarization", "Compliance", "Classification", "Chatbot"])
+    model = st.selectbox("Model:", ["deepseek-r1", "qwen-2.5.1-coder-it", "llama-3.2-3b-it", "gemma-3-4b-it"])
+    text_input = st.text_area("Enter text / query:")
+
+    if st.button("Run LLM Task"):
+        if task == "Summarization":
+            result = summarize_text(text_input, model)
+        elif task == "Compliance":
+            result = compliance_check(text_input, model)
+        elif task == "Classification":
+            result = classify_text(text_input, model)
+        else:
+            result = chatbot(text_input, model=model)
+        st.subheader("🔍 Result")
+        st.write(result)
+
+# ---------------- Tab 2: ML ----------------
+with tab2:
+    st.header("ML Playground")
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+    target_column = st.text_input("Target column name")
+    ml_task = st.radio("ML Task:", ["Classification", "Regression"])
+
+    if uploaded_file and target_column:
+        df = pd.read_csv(uploaded_file)
+        st.write("📊 Data Preview", df.head())
+
+        if st.button("Train ML Model"):
+            if ml_task == "Classification":
+                model, acc, report = train_classifier(df, target_column)
+                st.success(f"Accuracy: {acc:.2f}")
+                st.text(report)
+            else:
+                model, mse = train_regressor(df, target_column)
+                st.success(f"MSE: {mse:.2f}")
+
+            st.session_state["model"] = model
+            st.session_state["df"] = df.drop(columns=[target_column])
+
+    if "model" in st.session_state:
+        st.subheader("🔮 Predict")
+        input_data = {}
+        for col in st.session_state["df"].columns:
+            input_data[col] = st.number_input(col, value=0.0)
+
+        if st.button("Predict on Input"):
+            new_data = pd.DataFrame([input_data])
+            pred = predict(st.session_state["model"], new_data)
+            st.success(f"Prediction: {pred[0]}")
+
+# ---------------- Tab 3: Doc Q&A ----------------
+with tab3:
+    st.header("Document Q&A (RAG)")
+    pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
+    if pdf_file:
+        with open(f"sample_docs/{pdf_file.name}", "wb") as f:
+            f.write(pdf_file.read())
+        st.session_state["collection"] = build_vectorstore(f"sample_docs/{pdf_file.name}")
+
+    query = st.text_input("Ask a question about the document")
+    if st.button("Query Document") and "collection" in st.session_state:
+        answer = query_rag(st.session_state["collection"], query)
+        st.subheader("Answer")
+        st.write(answer)
