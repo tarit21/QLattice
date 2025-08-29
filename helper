@@ -1,103 +1,54 @@
-Thanks, this helps a lot 👍
 
-Your **tested code** shows you’re not using `openai` directly, but instead **LangChain’s `ChatOpenAI` wrapper**, pointed at your internal TCS `genailab` deployment. That’s a bit different from the `openai` client the Streamlit app currently tries to use.
 
-Here’s what you need to change in your **Streamlit app (`app.py`)** to make it work with your tested setup:
+Title name:
 
----
+Manufacturing Inventory Query and Restock Suggestion Agent
 
-### 🔄 1. Replace the OpenAI import
+Problem Statement:
 
-Right now, your app has:
+Manufacturing teams need quick access to inventory levels and restock suggestio production delays.
 
-```python
-# Optional OpenAI import (graceful if not installed)
-OPENAI_AVAILABLE = True
-try:
-    from openai import OpenAI
-except Exception:
-    OPENAI_AVAILABLE = False
-```
+Steps:
 
-👉 Replace this with:
+Input current inventory data and production schedules.
 
-```python
-OPENAI_AVAILABLE = True
-try:
-    from langchain_openai import ChatOpenAI
-    import httpx
-except Exception:
-    OPENAI_AVAILABLE = False
-```
+Use LLM to answer queries about stock levels.
 
----
+Suggest restock quantities based on usage patterns.
 
-### 🔄 2. Initialize your LLM client
+Provide alerts for low inventory items.
 
-Somewhere near the top (after imports), configure your model exactly like your test script:
+Data Requirements:
 
-```python
-if OPENAI_AVAILABLE:
-    client = httpx.Client(verify=False)
+Inventory databases, production plans, and historical usage data.
 
-    llm = ChatOpenAI(
-        base_url="https://genailab.tcs.in/",
-        model="azure_ai/genailab-maas_DeepSeek-V3-0324",
-        api_key="your_api_key_here",  # replace with your actual key
-        http_client=client
-    )
-```
+Expected Output:
 
----
+Conversational responses with inventory status and restock recommendations in text format 
 
-### 🔄 3. Replace `client.chat.completions.create` calls
+List of currently available Models 
+• azure/genailab-maas-gpt-35-turbo
 
-The app currently does things like:
+• azure/genailab-maas-gpt-4o
 
-```python
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": prompt}],
-)
-return response.choices[0].message.content
-```
+• azure/genailab-maas-gpt-4o-mini
 
-👉 With `ChatOpenAI`, you just call:
+• azure/genailab-maas-text-embedding-3-large
 
-```python
-response = llm.invoke([{"role": "user", "content": prompt}])
-return response.content
-```
+• azure/genailab-maas-whisper
 
----
+• azure_ai/genailab-maas-DeepSeek-R1
 
-### 🔄 4. Update AI helper functions
+• azure_ai/genailab-maas-DeepSeek-V3-0324
 
-Everywhere the app builds prompts and calls OpenAI, just change the call style.
-For example:
+• azure_ai/genailab-maas-Llama-3.2-90B-Vision-Instruct
 
-```python
-def ai_summary(logs: List[str]) -> str:
-    if not OPENAI_AVAILABLE:
-        return "OpenAI not available."
+• azure_ai/genailab-maas-Llama-3.3-70B-Instruct
 
-    prompt = f"Summarize the following logs:\n\n" + "\n".join(logs[:50])
-    try:
-        response = llm.invoke([{"role": "user", "content": prompt}])
-        return response.content
-    except Exception as e:
-        return f"AI error: {e}"
-```
+• azure_ai/genailab-maas-Llama-4-Maverick-17B-128E-Instruct-FP8
 
----
+• azure_ai/genailab-maas-Phi-3.5-vision-instruct
 
-### ⚡ In Short
+• azure_ai/genailab-maas-Phi-4-reasoning
+Above are given models .. keys are also given to us... Please do it for a car manufacturing plant
 
-* ✅ Use `langchain_openai.ChatOpenAI` instead of `openai.OpenAI`.
-* ✅ Initialize once with your `genailab` base\_url, model, and API key.
-* ✅ Swap `.chat.completions.create(...)` → `.invoke([...])`.
-* ✅ Use `.content` instead of `response.choices[0].message.content`.
-
----
-
-👉 Do you want me to go through your **whole app.py** and give you a **patched version** where all OpenAI calls are already switched to your `ChatOpenAI` style?
