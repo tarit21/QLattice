@@ -9,9 +9,9 @@ import requests
 EXCEL_FILE = "manufacturing_data.xlsx"
 
 # 🔧 Hackathon LLM config (fixed in backend)
-BASE_URL = "https://api.deepseek.com/v1"
-MODEL = "deepseek-chat"
-DEEPSEEK_API_KEY = "your_api_key_here"   # Replace with hackathon key
+BASE_URL = "https://genailab.tcs.in/"
+MODEL = "azure_ai/genailab-maas-DeepSeek-V3-0324"
+DEEPSEEK_API_KEY = "sk-3TU_hoTWxj_UIYkClzZpkA"   # Replace with hackathon key
 
 # --------------------------
 # LOAD DATA
