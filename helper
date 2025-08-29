@@ -1,54 +1,295 @@
+# streamlit_inventory_agent.py
+# Manufacturing Inventory Query & Restock Suggestion Agent (single-file Streamlit app)
+# - Generates synthetic data for a car manufacturing plant
+# - Shows inventory status, restock suggestions, alerts
+# - Integrated LangChain OpenAI model call for conversational AI
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+from datetime import datetime, timedelta
+import random
+
+# LangChain OpenAI imports
+from langchain_openai import ChatOpenAI
+import httpx
+
+st.set_page_config(page_title="Inventory Query & Restock Agent", layout="wide")
+
+# ---------------------------
+# Synthetic Data Generation
+# ---------------------------
+@st.cache_data
+def generate_synthetic_data(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    parts = [
+        ("P-1001", "Shock Absorber", "Suspension", "pcs"),
+        ("P-1002", "Brake Pad", "Brake", "sets"),
+        ("P-1003", "Engine Mount", "Engine", "pcs"),
+        ("P-1004", "Wiring Harness", "Electrical", "pcs"),
+        ("P-1005", "Fuel Pump", "Fuel", "pcs"),
+        ("P-1006", "Radiator", "Cooling", "pcs"),
+        ("P-1007", "Alternator", "Electrical", "pcs"),
+        ("P-1008", "Transmission Filter", "Transmission", "pcs"),
+        ("P-1009", "Air Filter", "Engine", "pcs"),
+        ("P-1010", "Steering Column", "Chassis", "pcs"),
+    ]
+    inventory_items = []
+    suppliers = []
+
+    for i, (pid, name, cat, uom) in enumerate(parts):
+        on_hand = int(np.random.poisson(lam=200 - i*10))
+        reserved = int(on_hand * np.random.uniform(0.02, 0.12))
+        on_order = int(np.random.choice([0, 50, 100, 150], p=[0.4,0.3,0.2,0.1]))
+        safety_stock = int(max(5, on_hand * 0.1))
+        moq = int(np.random.choice([10, 25, 50, 100]))
+        reorder_qty = None
+        last_received = (datetime.now() - timedelta(days=int(np.random.exponential(10)))).date()
+        inventory_items.append({
+            'part_id': pid,
+            'part_name': name,
+            'category': cat,
+            'unit_of_measure': uom,
+            'on_hand_qty': on_hand,
+            'reserved_qty': reserved,
+            'on_order_qty': on_order,
+            'safety_stock': safety_stock,
+            'moq': moq,
+            'reorder_qty': reorder_qty,
+            'last_received_date': str(last_received)
+        })
+
+        suppliers.append({
+            'supplier_id': f'S-{100+i}',
+            'supplier_name': f'GlobalParts Co {i+1}',
+            'avg_lead_time_days': int(np.random.normal(loc=7, scale=2))+1,
+            'lead_time_std_days': max(1, int(abs(np.random.normal(loc=2, scale=1)))),
+            'contact_info': f'procurement{i+1}@globalparts.example.com'
+        })
+
+    inventory_df = pd.DataFrame(inventory_items)
+    suppliers_df = pd.DataFrame(suppliers)
+
+    bom = []
+    models = ['Sedan A', 'SUV B', 'Hatch C']
+    for model in models:
+        for row in inventory_df.itertuples():
+            qty_per_unit = 1
+            if 'Shock' in row.part_name:
+                qty_per_unit = 2
+            if 'Brake' in row.part_name:
+                qty_per_unit = 1
+            if 'Wiring' in row.part_name:
+                qty_per_unit = 1
+            bom.append({'model_name': model, 'part_id': row.part_id, 'qty_per_unit': qty_per_unit})
+    bom_df = pd.DataFrame(bom)
+
+    days = 60
+    usage_rows = []
+    for d in range(days):
+        day = (datetime.now().date() - timedelta(days=d))
+        for row in inventory_df.itertuples():
+            base = max(1, int(np.random.poisson(lam=50 - (int(row.Index))*3)))
+            if random.random() < 0.02:
+                qty_used = base * random.randint(3,6)
+            else:
+                qty_used = max(0, base + int(np.random.normal(0, 6)))
+            usage_rows.append({'part_id': row.part_id, 'date': str(day), 'qty_used': int(qty_used)})
+    usage_df = pd.DataFrame(usage_rows)
+
+    schedule_rows = []
+    for d in range(1,8):
+        day = (datetime.now().date() + timedelta(days=d))
+        for model in models:
+            planned_qty = int(np.random.choice([20,30,40,50], p=[0.25,0.35,0.25,0.15]))
+            schedule_rows.append({'schedule_date': str(day), 'model_name': model, 'planned_qty': planned_qty})
+    schedule_df = pd.DataFrame(schedule_rows)
+
+    po_rows = []
+    for row in inventory_df.itertuples():
+        if row.on_order_qty > 0:
+            supplier_sample = suppliers_df.sample(1).iloc[0]
+            po_rows.append({
+                'po_id': f'PO-{row.part_id}-{random.randint(1000,9999)}',
+                'part_id': row.part_id,
+                'supplier_id': supplier_sample['supplier_id'],
+                'order_qty': int(row.on_order_qty),
+                'order_date': str((datetime.now().date()-timedelta(days=random.randint(1,10)))),
+                'expected_days': supplier_sample['avg_lead_time_days']
+            })
+    po_df = pd.DataFrame(po_rows)
+
+    return inventory_df, usage_df, bom_df, schedule_df, suppliers_df, po_df
+
+# ---------------------------
+# Restock & calculations
+# ---------------------------
+
+def compute_avg_sigma(usage_df: pd.DataFrame, part_id: str, window_days: int = 30):
+    subset = usage_df[usage_df['part_id'] == part_id].sort_values('date', ascending=False).head(window_days)
+    if subset.empty:
+        return 0.0, 0.0
+    avg_daily = subset['qty_used'].mean()
+    sigma = subset['qty_used'].std(ddof=0)
+    return float(avg_daily), float(sigma if not np.isnan(sigma) else 0.0)
 
 
-Title name:
+def restock_suggestion(avg_daily, sigma_daily, lead_time_days, on_hand, on_order, moq=0, z=1.645, review_period=1):
+    avg_daily = max(0.0, float(avg_daily))
+    sigma_daily = max(0.0, float(sigma_daily))
+    lead_time_days = max(1, int(lead_time_days))
 
-Manufacturing Inventory Query and Restock Suggestion Agent
+    safety_stock = z * sigma_daily * math.sqrt(lead_time_days)
+    rop = avg_daily * lead_time_days + safety_stock
+    target_stock = avg_daily * (lead_time_days + review_period) + safety_stock
+    shortfall = max(0.0, target_stock - (on_hand + on_order))
+    reorder_qty = max(moq, math.ceil(shortfall)) if shortfall > 0 else 0
+    return {
+        'avg_daily': round(avg_daily,2),
+        'sigma_daily': round(sigma_daily,2),
+        'safety_stock': int(math.ceil(safety_stock)),
+        'ROP': int(math.ceil(rop)),
+        'target_stock': int(math.ceil(target_stock)),
+        'shortfall': int(math.ceil(shortfall)),
+        'reorder_qty': int(reorder_qty)
+    }
 
-Problem Statement:
+# ---------------------------
+# Azure LLM integration via LangChain OpenAI client
+# ---------------------------
 
-Manufacturing teams need quick access to inventory levels and restock suggestio production delays.
+import httpx
 
-Steps:
+# Initialize HTTP client with SSL verification off (if needed, e.g. hackathon env)
+client = httpx.Client(verify=False)
 
-Input current inventory data and production schedules.
+# Initialize LangChain OpenAI LLM client once
+llm = ChatOpenAI(
+    base_url="https://genailab.tcs.in/",
+    model="azure_ai/genailab-maas-DeepSeek-V3-0324",
+    api_key="sk-3TU_hoTWxj_UIYkClzZpkA",  # Replace with your actual API key in prod
+    http_client=client
+)
 
-Use LLM to answer queries about stock levels.
+def call_azure_llm_placeholder(prompt_text: str):
+    """
+    Calls the Azure OpenAI model via LangChain ChatOpenAI client.
+    """
+    try:
+        messages = [{"role": "user", "content": prompt_text}]
+        response = llm.invoke(messages)
+        return response.content
+    except Exception as e:
+        return f"[LLM Error] {e}"
 
-Suggest restock quantities based on usage patterns.
+# ---------------------------
+# UI
+# ---------------------------
 
-Provide alerts for low inventory items.
+def main():
+    st.title("Manufacturing Inventory Query & Restock Suggestion Agent — Car Plant")
 
-Data Requirements:
+    inv_df, usage_df, bom_df, schedule_df, suppliers_df, po_df = generate_synthetic_data()
 
-Inventory databases, production plans, and historical usage data.
+    # Sidebar controls
+    st.sidebar.header("Controls")
+    part_select = st.sidebar.selectbox("Select Part", options=inv_df['part_id'] + ' - ' + inv_df['part_name'])
+    selected_part_id = part_select.split(' - ')[0]
+    review_window = st.sidebar.slider("Usage window (days)", min_value=7, max_value=60, value=30)
+    service_level = st.sidebar.selectbox("Service level (approx)", options=['90%','95%','99%'])
+    z_map = {'90%':1.282,'95%':1.645,'99%':2.33}
+    z = z_map[service_level]
 
-Expected Output:
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Quick actions**")
+    if st.sidebar.button("Generate an example PO for selected part"):
+        row = inv_df[inv_df['part_id']==selected_part_id].iloc[0]
+        supplier_sample = suppliers_df.sample(1).iloc[0]
+        new_po = {
+            'po_id': f'PO-{selected_part_id}-{random.randint(2000,9999)}',
+            'part_id': selected_part_id,
+            'supplier_id': supplier_sample['supplier_id'],
+            'order_qty': int(max(50, row.on_hand_qty*0.5)),
+            'order_date': str(datetime.now().date()),
+            'expected_days': int(supplier_sample['avg_lead_time_days'])
+        }
+        po_df = pd.concat([po_df, pd.DataFrame([new_po])], ignore_index=True)
+        st.sidebar.success(f"Created PO {new_po['po_id']} (in-memory)")
 
-Conversational responses with inventory status and restock recommendations in text format 
+    left, right = st.columns([1,1])
 
-List of currently available Models 
-• azure/genailab-maas-gpt-35-turbo
+    with left:
+        st.subheader("Part Inventory & Usage")
+        part_row = inv_df[inv_df['part_id']==selected_part_id].iloc[0]
+        st.metric("On-hand qty", part_row.on_hand_qty)
+        st.metric("Reserved qty", part_row.reserved_qty)
+        st.metric("On-order qty", part_row.on_order_qty)
+        st.write("**Last received**: ", part_row.last_received_date)
 
-• azure/genailab-maas-gpt-4o
+        st.markdown(f"### Recent daily usage (last {review_window} days)")
+        display_usage = usage_df[(usage_df['part_id']==selected_part_id)].sort_values('date', ascending=False).head(review_window)
+        st.dataframe(display_usage.reset_index(drop=True))
 
-• azure/genailab-maas-gpt-4o-mini
+    with right:
+        st.subheader("Restock Suggestion")
+        avg_daily, sigma_daily = compute_avg_sigma(usage_df, selected_part_id, window_days=review_window)
+        supplier_info = suppliers_df.sample(1).iloc[0]
+        lead_time = supplier_info['avg_lead_time_days']
+        suggestion = restock_suggestion(avg_daily, sigma_daily, lead_time,
+                                        int(part_row.on_hand_qty), int(part_row.on_order_qty),
+                                        moq=int(part_row.moq), z=z)
 
-• azure/genailab-maas-text-embedding-3-large
+        st.write(f"**Avg daily usage ({review_window}d):** {suggestion['avg_daily']} units/day")
+        st.write(f"**Sigma daily usage:** {suggestion['sigma_daily']}")
+        st.write(f"**Supplier (sampled):** {supplier_info['supplier_name']} (LT ~ {lead_time} days)")
+        st.write(f"**Safety stock** (z={z}): {suggestion['safety_stock']} units")
+        st.write(f"**Reorder point (ROP):** {suggestion['ROP']} units")
+        st.write(f"**Target stock**: {suggestion['target_stock']} units")
+        st.write(f"**On-hand + on-order:** {int(part_row.on_hand_qty) + int(part_row.on_order_qty)} units")
 
-• azure/genailab-maas-whisper
+        if suggestion['shortfall'] > 0:
+            st.error(f"Shortfall detected: {suggestion['shortfall']} units. Suggested reorder qty: {suggestion['reorder_qty']} units")
+        else:
+            st.success("No reorder needed at this time based on current assumptions.")
 
-• azure_ai/genailab-maas-DeepSeek-R1
+        st.markdown("**Recommendation details**")
+        st.write(f"Reorder quantity (consider MOQ): {suggestion['reorder_qty']} (MOQ = {part_row.moq})")
 
-• azure_ai/genailab-maas-DeepSeek-V3-0324
+    st.markdown("---")
+    st.subheader("Alerts & Issues")
+    alerts = []
+    if (part_row.on_hand_qty + part_row.on_order_qty) <= suggestion['ROP']:
+        alerts.append({'part_id': selected_part_id, 'severity':'High', 'message':'On-hand + on-order <= ROP (reorder point)'})
 
-• azure_ai/genailab-maas-Llama-3.2-90B-Vision-Instruct
+    next_days = lead_time
+    upcoming_usage = avg_daily * next_days
+    if (part_row.on_hand_qty + part_row.on_order_qty) < upcoming_usage:
+        alerts.append({'part_id': selected_part_id, 'severity':'Medium', 'message':'Inventory may run out before next shipment arrives'})
 
-• azure_ai/genailab-maas-Llama-3.3-70B-Instruct
+    if alerts:
+        alert_df = pd.DataFrame(alerts)
+        st.dataframe(alert_df)
+    else:
+        st.write("No alerts detected for this part.")
 
-• azure_ai/genailab-maas-Llama-4-Maverick-17B-128E-Instruct-FP8
+    st.markdown("---")
+    st.subheader("Interactive Chat with Inventory Agent (via LLM)")
 
-• azure_ai/genailab-maas-Phi-3.5-vision-instruct
+    chat_input = st.text_area("Enter your question or request about inventory:")
+    if st.button("Ask Agent"):
+        if chat_input.strip():
+            prompt = f"""You are an inventory management assistant for a car manufacturing plant.
+            Answer concisely and accurately based on inventory, usage, restocking logic.
+            Question: {chat_input.strip()}
+            """
+            response = call_azure_llm_placeholder(prompt)
+            st.markdown("**Agent response:**")
+            st.write(response)
+        else:
+            st.warning("Please enter a question or request.")
 
-• azure_ai/genailab-maas-Phi-4-reasoning
-Above are given models .. keys are also given to us... Please do it for a car manufacturing plant
-
+if __name__ == "__main__":
+    main()
