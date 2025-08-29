@@ -410,4 +410,24 @@ elif page == "Chat (LLM)":
             )
 
             messages = [
-                {"role": "system", "content": "You are a he
+                {"role": "system", "content": "You are a helpful manufacturing inventory assistant."},
+                {"role": "user", "content": prompt}
+            ]
+
+            # Call LLM via LangChain or REST fallback and show debug info
+            with st.spinner("Calling LLM..."):
+                result = llm_request_with_fallback(llm_base_url, llm_model, llm_api_key, messages)
+                if result.get("text"):
+                    st.subheader("LLM Answer")
+                    st.write(result["text"])
+                else:
+                    st.error("LLM call failed. See debug below.")
+                with st.expander("🔍 Debug (methods tried & raw)"):
+                    st.json(result.get("debug", {}))
+                    if "raw" in result:
+                        st.write("Raw response (truncated):")
+                        st.write(result["raw"])
+
+# Footer
+st.markdown("---")
+st.caption("Notes: Provide correct LLM base URL, deployment/model and API key in the sidebar. LangChain usage is attempted first; fallback to REST is automatic. Ensure network access to the model endpoint from your environment.")
