@@ -1,14 +1,13 @@
-
 import streamlit as st
 import pandas as pd
-import requests
+from langchain_openai import ChatOpenAI
+import httpx
 
 # --------------------------
 # CONFIGURATION
 # --------------------------
 EXCEL_FILE = "manufacturing_data.xlsx"
 
-# 🔧 Hackathon LLM config
 BASE_URL = "https://genailab.tcs.in/"
 MODEL = "azure_ai/genailab-maas-DeepSeek-V3-0324"
 DEEPSEEK_API_KEY = "sk-xxx"   # Replace with your hackathon key
@@ -23,31 +22,24 @@ def load_data(file):
     return data
 
 # --------------------------
-# LLM ASK FUNCTION (with context)
+# LLM SETUP (LangChain)
 # --------------------------
-def ask_llm(question, api_key, context=""):
-    url = f"{BASE_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": "You are an assistant that answers ONLY using the provided manufacturing data."},
-            {"role": "user", "content": f"Data context:\n{context}"},
-            {"role": "user", "content": f"Question: {question}"}
-        ],
-        "temperature": 0.4
-    }
+client = httpx.Client(verify=False)  # Ignore SSL verify
+llm = ChatOpenAI(
+    base_url=BASE_URL,
+    model=MODEL,
+    api_key=DEEPSEEK_API_KEY,
+    http_client=client
+)
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"], data
-    except Exception as e:
-        return f"❌ Error: {e}", None
+def ask_llm(question, context=""):
+    messages = [
+        {"role": "system", "content": "You are an assistant that answers ONLY using the provided manufacturing data."},
+        {"role": "user", "content": f"Data:\n{context}"},
+        {"role": "user", "content": f"Question: {question}"}
+    ]
+    response = llm.invoke(messages)
+    return response.content
 
 # --------------------------
 # STREAMLIT UI
@@ -77,15 +69,16 @@ if page == "Inventory Dashboard":
         st.subheader("Current Inventory")
         st.dataframe(data["Inventory"].head(20))
 
-        low_stock = data["Inventory"][data["Inventory"]["StockQuantity"] < 50]
+        # Low stock = on_hand < reorder_point
+        low_stock = data["Inventory"][data["Inventory"]["on_hand"] < data["Inventory"]["reorder_point"]]
         if not low_stock.empty:
             st.warning("⚠️ Low Stock Items:")
             st.dataframe(low_stock)
 
     if "Usage" in data:
         st.subheader("Historical Usage Trends")
-        usage_summary = data["Usage"].groupby("PartID")["QuantityUsed"].sum().reset_index()
-        st.bar_chart(usage_summary.set_index("PartID"))
+        usage_summary = data["Usage"].groupby("part_id")["demand_qty"].sum().reset_index()
+        st.bar_chart(usage_summary.set_index("part_id"))
 
     if "PurchaseOrders" in data:
         st.subheader("Recent Purchase Orders")
@@ -104,24 +97,18 @@ elif page == "Ask LLM":
         if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.startswith("sk-xxx"):
             st.error("⚠️ Please set a valid DEEPSEEK_API_KEY in code.")
         else:
-            # 👉 Basic RAG: choose relevant context
-            context = ""
-            if "Inventory" in data:
-                context = data["Inventory"].head(50).to_json(orient="records")
-
-            answer, raw = ask_llm(user_q, DEEPSEEK_API_KEY, context=context)
+            # Provide first 50 rows of inventory as context
+            context = data["Inventory"].head(50).to_json(orient="records")
+            answer = ask_llm(user_q, context=context)
             st.success(answer)
-
-            with st.expander("🔎 Debug: Raw API Response"):
-                st.json(raw)
 
     st.subheader("Quick Ask")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Which items need restocking soon?"):
-            low_stock = data["Inventory"][data["Inventory"]["StockQuantity"] < 50]
+            low_stock = data["Inventory"][data["Inventory"]["on_hand"] < data["Inventory"]["reorder_point"]]
             context = low_stock.to_json(orient="records") if not low_stock.empty else "No low stock"
-            answer, _ = ask_llm("Which items need restocking soon?", DEEPSEEK_API_KEY, context)
+            answer = ask_llm("Which items need restocking soon?", context)
             st.info(answer)
 
     with col2:
@@ -130,6 +117,5 @@ elif page == "Ask LLM":
                 context = data["PurchaseOrders"].tail(20).to_json(orient="records")
             else:
                 context = "No supplier data available"
-            answer, _ = ask_llm("Suggest suppliers for critical parts", DEEPSEEK_API_KEY, context)
+            answer = ask_llm("Suggest suppliers for critical parts", context)
             st.info(answer)
-
