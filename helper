@@ -1,0 +1,103 @@
+Thanks, this helps a lot 👍
+
+Your **tested code** shows you’re not using `openai` directly, but instead **LangChain’s `ChatOpenAI` wrapper**, pointed at your internal TCS `genailab` deployment. That’s a bit different from the `openai` client the Streamlit app currently tries to use.
+
+Here’s what you need to change in your **Streamlit app (`app.py`)** to make it work with your tested setup:
+
+---
+
+### 🔄 1. Replace the OpenAI import
+
+Right now, your app has:
+
+```python
+# Optional OpenAI import (graceful if not installed)
+OPENAI_AVAILABLE = True
+try:
+    from openai import OpenAI
+except Exception:
+    OPENAI_AVAILABLE = False
+```
+
+👉 Replace this with:
+
+```python
+OPENAI_AVAILABLE = True
+try:
+    from langchain_openai import ChatOpenAI
+    import httpx
+except Exception:
+    OPENAI_AVAILABLE = False
+```
+
+---
+
+### 🔄 2. Initialize your LLM client
+
+Somewhere near the top (after imports), configure your model exactly like your test script:
+
+```python
+if OPENAI_AVAILABLE:
+    client = httpx.Client(verify=False)
+
+    llm = ChatOpenAI(
+        base_url="https://genailab.tcs.in/",
+        model="azure_ai/genailab-maas_DeepSeek-V3-0324",
+        api_key="your_api_key_here",  # replace with your actual key
+        http_client=client
+    )
+```
+
+---
+
+### 🔄 3. Replace `client.chat.completions.create` calls
+
+The app currently does things like:
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": prompt}],
+)
+return response.choices[0].message.content
+```
+
+👉 With `ChatOpenAI`, you just call:
+
+```python
+response = llm.invoke([{"role": "user", "content": prompt}])
+return response.content
+```
+
+---
+
+### 🔄 4. Update AI helper functions
+
+Everywhere the app builds prompts and calls OpenAI, just change the call style.
+For example:
+
+```python
+def ai_summary(logs: List[str]) -> str:
+    if not OPENAI_AVAILABLE:
+        return "OpenAI not available."
+
+    prompt = f"Summarize the following logs:\n\n" + "\n".join(logs[:50])
+    try:
+        response = llm.invoke([{"role": "user", "content": prompt}])
+        return response.content
+    except Exception as e:
+        return f"AI error: {e}"
+```
+
+---
+
+### ⚡ In Short
+
+* ✅ Use `langchain_openai.ChatOpenAI` instead of `openai.OpenAI`.
+* ✅ Initialize once with your `genailab` base\_url, model, and API key.
+* ✅ Swap `.chat.completions.create(...)` → `.invoke([...])`.
+* ✅ Use `.content` instead of `response.choices[0].message.content`.
+
+---
+
+👉 Do you want me to go through your **whole app.py** and give you a **patched version** where all OpenAI calls are already switched to your `ChatOpenAI` style?
