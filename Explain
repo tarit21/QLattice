@@ -1,0 +1,90 @@
+Got it 💡 You need a **speech script** that you can deliver in the hackathon — covering **data generation → analytics → model → Streamlit UI** in one flow. I’ll write it like a **storytelling pitch** you can use directly.
+
+---
+
+# 🎤 Hackathon Speech Script
+
+---
+
+### 🔹 1. Introduction
+
+“Hello everyone,
+Our project is a **Manufacturing Inventory Copilot** — an AI-powered system that helps planners and supervisors make faster and smarter supply chain decisions.
+
+Since hackathons often don’t provide full ERP datasets, we first built a **synthetic dataset generator**. This ensures that our solution can be demonstrated end-to-end, without dependency on external systems, but still mimics real-world manufacturing complexity.”
+
+---
+
+### 🔹 2. Data Generation
+
+“We generated data across **six key dimensions**:
+
+1. **Suppliers** – 50 suppliers with lead times and quality ratings, just like real vendor master data.
+2. **Inventory** – 200 unique parts, each with on-hand stock, reorder point, MOQ, and linked suppliers.
+3. **Usage History** – 3 years of daily part consumption, simulated with **Poisson distributions** to model real-world random demand.
+4. **Production Schedule** – Planned daily builds for different car models like Sedan, SUV, Truck, EV, and Luxury cars.
+5. **BOM (Bill of Materials)** – Each model requires \~50 parts, so our system knows exactly which part is consumed when a car is built.
+6. **Purchase Orders** – 2000 orders with status like *Open*, *Closed*, or *In Transit*, to simulate procurement flow.
+
+Finally, all this is exported into a **single Excel file with six sheets**, which acts like our ERP system.”
+
+---
+
+### 🔹 3. Analytics Layer
+
+“On top of this dataset, we built **analytics functions** that simulate what planners would ask:
+
+* *Which parts are below reorder point?*
+* *Which suppliers are causing the most shortages?*
+* *What’s the 7-day demand forecast per part?*
+* *Which parts are at risk of stockout next week?*
+
+This transforms raw data into **actionable supply chain insights**.”
+
+---
+
+### 🔹 4. AI Model Choice
+
+“For reasoning and natural language interaction, we integrated **DeepSeek V3**.
+
+Why this model?
+
+* It’s **fast and lightweight**, which is critical in a hackathon setup.
+* It provides **structured reasoning**, so when you ask: *‘Which suppliers are risky for EV production next month?’* — the model can combine BOM, demand, supplier lead times, and inventory levels to give a contextual answer.
+
+So the model isn’t just answering — it’s **reasoning across multiple data sources**.”
+
+---
+
+### 🔹 5. Streamlit UI (Copilot Experience)
+
+“All of this comes together in our **Streamlit UI**, designed to feel like a **Copilot dashboard + chat assistant**:
+
+* On the **left side**, we have filters, search, and quick actions like *View Shortages*, *Check Supplier Risk*, *Forecast Demand*.
+* On the **main screen**, we show **interactive charts and tables** powered by Altair.
+* At the bottom, there’s a **chat box** where the user can ask questions in plain English, like:
+
+  * *‘Show me parts below reorder point from Supplier\_12’*
+  * *‘Forecast shortages for EV production in next 14 days’*
+
+The AI responds with both **answers + visualizations**, making decisions explainable and interactive.”
+
+---
+
+### 🔹 6. End Pitch
+
+“In short, our solution combines:
+
+* **Synthetic data generation** to simulate ERP, MES, and procurement data.
+* **Analytics layer** for actionable insights.
+* **DeepSeek V3 AI model** for reasoning and natural language queries.
+* **Streamlit UI** for an interactive Copilot experience.
+
+This makes our system not just a demo, but a **blueprint for an enterprise-grade AI planning assistant** in manufacturing.”
+
+---
+
+👉 This script is **end-to-end** — you can narrate it while showing your code, Excel, and Streamlit app.
+
+Would you like me to also **trim this into a 2-minute sharp pitch** (for judges) and a **5-minute detailed walkthrough** (for teammates)?
+
