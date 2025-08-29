@@ -8,10 +8,10 @@ import requests
 # --------------------------
 EXCEL_FILE = "manufacturing_data.xlsx"
 
-# 🔧 Hackathon LLM config (fixed in backend)
+# 🔧 Hackathon LLM config
 BASE_URL = "https://genailab.tcs.in/"
 MODEL = "azure_ai/genailab-maas-DeepSeek-V3-0324"
-DEEPSEEK_API_KEY = "sk-3TU_hoTWxj_UIYkClzZpkA"   # Replace with hackathon key
+DEEPSEEK_API_KEY = "sk-xxx"   # Replace with your hackathon key
 
 # --------------------------
 # LOAD DATA
@@ -23,9 +23,9 @@ def load_data(file):
     return data
 
 # --------------------------
-# LLM ASK FUNCTION
+# LLM ASK FUNCTION (with context)
 # --------------------------
-def ask_llm(question, api_key):
+def ask_llm(question, api_key, context=""):
     url = f"{BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -33,12 +33,16 @@ def ask_llm(question, api_key):
     }
     payload = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": question}],
-        "temperature": 0.7
+        "messages": [
+            {"role": "system", "content": "You are an assistant that answers ONLY using the provided manufacturing data."},
+            {"role": "user", "content": f"Data context:\n{context}"},
+            {"role": "user", "content": f"Question: {question}"}
+        ],
+        "temperature": 0.4
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)  # 👈 ignore SSL certs
+        response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"], data
@@ -97,10 +101,15 @@ elif page == "Ask LLM":
                           placeholder="e.g., Which parts are at risk of stockout next week?")
 
     if st.button("Ask LLM"):
-        if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.startswith("your_"):
+        if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.startswith("sk-xxx"):
             st.error("⚠️ Please set a valid DEEPSEEK_API_KEY in code.")
         else:
-            answer, raw = ask_llm(user_q, DEEPSEEK_API_KEY)
+            # 👉 Basic RAG: choose relevant context
+            context = ""
+            if "Inventory" in data:
+                context = data["Inventory"].head(50).to_json(orient="records")
+
+            answer, raw = ask_llm(user_q, DEEPSEEK_API_KEY, context=context)
             st.success(answer)
 
             with st.expander("🔎 Debug: Raw API Response"):
@@ -110,9 +119,17 @@ elif page == "Ask LLM":
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Which items need restocking soon?"):
-            answer, _ = ask_llm("Which items need restocking soon?", DEEPSEEK_API_KEY)
+            low_stock = data["Inventory"][data["Inventory"]["StockQuantity"] < 50]
+            context = low_stock.to_json(orient="records") if not low_stock.empty else "No low stock"
+            answer, _ = ask_llm("Which items need restocking soon?", DEEPSEEK_API_KEY, context)
             st.info(answer)
+
     with col2:
         if st.button("Suggest suppliers for critical parts"):
-            answer, _ = ask_llm("Suggest suppliers for critical parts", DEEPSEEK_API_KEY)
+            if "PurchaseOrders" in data:
+                context = data["PurchaseOrders"].tail(20).to_json(orient="records")
+            else:
+                context = "No supplier data available"
+            answer, _ = ask_llm("Suggest suppliers for critical parts", DEEPSEEK_API_KEY, context)
             st.info(answer)
+
