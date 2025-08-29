@@ -1,0 +1,273 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+from langchain_openai import ChatOpenAI
+import httpx
+
+# =========================================
+# CONFIGURATION
+# =========================================
+EXCEL_FILE = "manufacturing_data.xlsx"
+
+# LLM (DeepSeek via TCS GenAI Lab)
+BASE_URL = "https://genailab.tcs.in/"
+MODEL = "azure_ai/genailab-maas-DeepSeek-V3-0324"
+
+# Prefer secrets if available; fallback to inline
+DEEPSEEK_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", "sk-xxx")  # <-- put your key in .streamlit/secrets.toml or replace here
+
+# =========================================
+# HELPERS
+# =========================================
+@st.cache_data
+def load_data(file: str) -> dict:
+    xls = pd.ExcelFile(file)
+    return {sheet: pd.read_excel(xls, sheet) for sheet in xls.sheet_names}
+
+@st.cache_data
+def compute_forecast_last_30d(usage_df: pd.DataFrame) -> pd.DataFrame:
+    if usage_df.empty:
+        return pd.DataFrame(columns=["part_id", "avg_daily_demand"])
+    max_date = usage_df["date"].max()
+    recent = usage_df[usage_df["date"] > max_date - timedelta(days=30)]
+    fc = (
+        recent.groupby("part_id")["demand_qty"]
+        .mean()
+        .reset_index(name="avg_daily_demand")
+    )
+    return fc
+
+def parts_below_reorder(inventory_df: pd.DataFrame) -> pd.DataFrame:
+    return inventory_df[inventory_df["on_hand"] < inventory_df["reorder_point"]].copy()
+
+def stockout_risk_7d(inventory_df: pd.DataFrame, forecast_df: pd.DataFrame) -> pd.DataFrame:
+    merged = inventory_df.merge(forecast_df, on="part_id", how="left").fillna({"avg_daily_demand": 0})
+    merged["expected_demand_7d"] = merged["avg_daily_demand"] * 7
+    merged["risk_of_stockout"] = merged["on_hand"] < merged["expected_demand_7d"]
+    at_risk = merged[merged["risk_of_stockout"]].copy()
+    return at_risk[["part_id", "description", "on_hand", "expected_demand_7d"]].sort_values("expected_demand_7d", ascending=False)
+
+def restock_recommendations_30d(inventory_df: pd.DataFrame, forecast_df: pd.DataFrame, suppliers_df: pd.DataFrame) -> pd.DataFrame:
+    merged = inventory_df.merge(forecast_df, on="part_id", how="left").fillna({"avg_daily_demand": 0})
+    merged["expected_demand_30d"] = merged["avg_daily_demand"] * 30
+    # Order enough to cover next 30 days; minimum order = MOQ (if positive gap)
+    gap = (merged["expected_demand_30d"] - merged["on_hand"]).clip(lower=0)
+    merged["recommended_order_qty"] = np.where(gap > 0, np.maximum(gap, merged["MOQ"]), 0).round().astype(int)
+
+    reco = merged[merged["recommended_order_qty"] > 0].copy()
+    reco = reco.merge(suppliers_df, on="supplier_id", how="left")
+    cols = [
+        "part_id", "description", "category", "on_hand", "reorder_point",
+        "expected_demand_30d", "MOQ", "recommended_order_qty",
+        "supplier_id", "name", "lead_time_days", "rating"
+    ]
+    reco = reco[cols].sort_values(["lead_time_days", "recommended_order_qty"], ascending=[True, False])
+    return reco
+
+def df_to_json_slice(df: pd.DataFrame, max_rows: int = 60) -> str:
+    if df is None or df.empty:
+        return "[]"
+    return df.head(max_rows).to_json(orient="records")
+
+# =========================================
+# LLM SETUP (LangChain ChatOpenAI)
+# =========================================
+def build_llm():
+    if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.startswith("sk-xxx"):
+        return None, "⚠️ Set a valid DEEPSEEK_API_KEY (secrets or inline)."
+    client = httpx.Client(verify=False)  # ignore SSL in hackathon env
+    llm = ChatOpenAI(
+        base_url=BASE_URL,
+        model=MODEL,
+        api_key=DEEPSEEK_API_KEY,
+        http_client=client
+    )
+    return llm, None
+
+def ask_llm(llm: ChatOpenAI, question: str, context: str) -> str:
+    messages = [
+        {"role": "system", "content": (
+            "You are a manufacturing inventory assistant. "
+            "Answer ONLY using the provided JSON data context. "
+            "If the answer is not in the context, say you don't have enough data."
+        )},
+        {"role": "user", "content": f"Data context (JSON array(s)):\n{context}"},
+        {"role": "user", "content": f"Question:\n{question}"}
+    ]
+    resp = llm.invoke(messages)
+    return resp.content
+
+# =========================================
+# UI LAYOUT
+# =========================================
+st.set_page_config(page_title="Manufacturing Inventory Agent", layout="wide")
+st.title("🏭 Manufacturing Inventory Query & Restock Suggestion Agent")
+
+# Load data
+try:
+    data = load_data(EXCEL_FILE)
+except Exception as e:
+    st.error(f"❌ Failed to load {EXCEL_FILE}: {e}")
+    st.stop()
+
+# Validate expected sheets
+required = ["Inventory", "Usage", "Suppliers"]
+missing = [s for s in required if s not in data]
+if missing:
+    st.error(f"❌ Missing expected sheets: {', '.join(missing)}")
+    st.stop()
+
+inv_df = data["Inventory"]
+usage_df = data["Usage"]
+sup_df = data["Suppliers"]
+po_df = data.get("PurchaseOrders", pd.DataFrame())
+bom_df = data.get("BOM", pd.DataFrame())
+sched_df = data.get("Schedule", pd.DataFrame())
+
+# Precompute analytics
+forecast_df = compute_forecast_last_30d(usage_df)
+low_stock_df = parts_below_reorder(inv_df)
+risk7_df = stockout_risk_7d(inv_df, forecast_df)
+reco30_df = restock_recommendations_30d(inv_df, forecast_df, sup_df)
+
+# Sidebar nav
+st.sidebar.header("Navigation")
+page = st.sidebar.radio("Go to:", ["Inventory Dashboard", "Ask LLM"])
+
+# =========================================
+# PAGE 1 — DASHBOARD
+# =========================================
+if page == "Inventory Dashboard":
+    st.header("📊 Inventory Dashboard")
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total Parts", f"{len(inv_df):,}")
+    with c2:
+        st.metric("Suppliers", f"{len(sup_df):,}")
+    with c3:
+        st.metric("Low Stock (< Reorder Pt.)", f"{len(low_stock_df):,}")
+    with c4:
+        st.metric("At Risk (Next 7d)", f"{len(risk7_df):,}")
+
+    st.subheader("📦 Current Inventory (sample)")
+    st.dataframe(inv_df.head(25), use_container_width=True)
+
+    st.subheader("⚠️ Low Stock Items (on_hand < reorder_point)")
+    if low_stock_df.empty:
+        st.success("All good! No items below reorder point.")
+    else:
+        st.dataframe(low_stock_df, use_container_width=True)
+
+    st.subheader("📈 Usage (Total by Part)")
+    if usage_df.empty:
+        st.info("No usage data available.")
+    else:
+        usage_summary = usage_df.groupby("part_id")["demand_qty"].sum().reset_index()
+        usage_summary = usage_summary.sort_values("demand_qty", ascending=False).head(50)
+        st.bar_chart(usage_summary.set_index("part_id"))
+
+    if not po_df.empty:
+        st.subheader("🧾 Recent Purchase Orders")
+        st.dataframe(po_df.sort_values("order_date").tail(20), use_container_width=True)
+
+    st.subheader("🛠️ Stockout Risk (Next 7 Days)")
+    if risk7_df.empty:
+        st.success("No parts projected to stock out in the next 7 days.")
+    else:
+        st.dataframe(risk7_df, use_container_width=True)
+
+    st.subheader("✅ Recommended Restock (Cover Next 30 Days)")
+    if reco30_df.empty:
+        st.success("No restock needed based on current 30-day demand forecast.")
+    else:
+        st.dataframe(reco30_df, use_container_width=True)
+
+# =========================================
+# PAGE 2 — LLM Q&A
+# =========================================
+elif page == "Ask LLM":
+    st.header("🔮 Ask the LLM about Your Data")
+
+    llm, llm_err = build_llm()
+    if llm_err:
+        st.error(llm_err)
+
+    # Context selector
+    st.caption("Tip: Select which data to pass as context for higher accuracy and lower tokens.")
+    ctx_options = st.multiselect(
+        "Choose context tables to include:",
+        options=["Inventory (first 60 rows)", "Low Stock", "Stockout Risk (7d)", "Restock Recommendations (30d)", "Recent POs (20)"],
+        default=["Inventory (first 60 rows)", "Low Stock", "Restock Recommendations (30d)"]
+    )
+
+    # Build context JSON
+    ctx_parts = []
+    if "Inventory (first 60 rows)" in ctx_options:
+        ctx_parts.append(df_to_json_slice(inv_df, 60))
+    if "Low Stock" in ctx_options:
+        ctx_parts.append(df_to_json_slice(low_stock_df, 200))
+    if "Stockout Risk (7d)" in ctx_options:
+        ctx_parts.append(df_to_json_slice(risk7_df, 200))
+    if "Restock Recommendations (30d)" in ctx_options:
+        ctx_parts.append(df_to_json_slice(reco30_df, 200))
+    if "Recent POs (20)" in ctx_options and not po_df.empty:
+        recent_pos = po_df.sort_values("order_date").tail(20)
+        ctx_parts.append(df_to_json_slice(recent_pos, 20))
+
+    context_json = "\n".join(ctx_parts) if ctx_parts else "[]"
+
+    user_q = st.text_area(
+        "Type your question:",
+        placeholder="e.g., Which parts are at risk of stockout next week? Who should we order from and how many units?",
+        height=120
+    )
+
+    colA, colB, colC = st.columns([1,1,1])
+
+    ask_clicked = colA.button("Ask LLM", use_container_width=True, disabled=(llm is None))
+    if ask_clicked:
+        try:
+            answer = ask_llm(llm, user_q, context_json)
+            st.success(answer)
+        except Exception as e:
+            st.error(f"LLM error: {e}")
+
+    # Quick Ask Buttons (auto context already built above)
+    with colB:
+        if st.button("Show stockout risks (7d)", use_container_width=True, disabled=(llm is None)):
+            q = "List parts projected to stock out in the next 7 days with on_hand and expected_demand_7d."
+            try:
+                ans = ask_llm(llm, q, context_json)
+                st.info(ans)
+            except Exception as e:
+                st.error(f"LLM error: {e}")
+
+    with colC:
+        if st.button("Suggest restock plan (30d)", use_container_width=True, disabled=(llm is None)):
+            q = (
+                "Using the context, propose a restock plan for the next 30 days. "
+                "For each part: part_id, recommended_order_qty, supplier_id/name, and lead_time_days. "
+                "Explain prioritization briefly."
+            )
+            try:
+                ans = ask_llm(llm, q, context_json)
+                st.info(ans)
+            except Exception as e:
+                st.error(f"LLM error: {e}")
+
+    st.divider()
+    st.caption("🔎 Debug")
+    with st.expander("Show context JSON (first 2,000 chars)"):
+        st.code(context_json[:2000] + ("..." if len(context_json) > 2000 else ""), language="json")
+
+# =========================================
+# FOOTER
+# =========================================
+st.markdown(
+    "<hr/><small>Built for <b>TCS AI Fridays Hackathon</b> — Manufacturing Inventory Query & Restock Suggestion Agent.</small>",
+    unsafe_allow_html=True
+)
