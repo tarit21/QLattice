@@ -1,0 +1,166 @@
+# streamlit_inventory_agent.py
+# Manufacturing Inventory Query & Restock Suggestion Agent (Streamlit app using manufacturing_data.xlsx)
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+from datetime import datetime, timedelta
+import random
+
+st.set_page_config(page_title="Inventory Query & Restock Agent", layout="wide")
+
+# ---------------------------
+# Load Excel Data
+# ---------------------------
+@st.cache_data
+def load_excel_data(file_path="manufacturing_data.xlsx"):
+    try:
+        xls = pd.ExcelFile(file_path)
+        suppliers_df = pd.read_excel(xls, "Suppliers")
+        inventory_df = pd.read_excel(xls, "Inventory")
+        usage_df = pd.read_excel(xls, "Usage")
+        schedule_df = pd.read_excel(xls, "Schedule")
+        bom_df = pd.read_excel(xls, "BOM")
+        purchase_orders_df = pd.read_excel(xls, "PurchaseOrders")
+        return inventory_df, usage_df, bom_df, schedule_df, suppliers_df, purchase_orders_df
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
+        return None, None, None, None, None, None
+
+# ---------------------------
+# Restock & calculations
+# ---------------------------
+
+def compute_avg_sigma(usage_df: pd.DataFrame, part_id: str, window_days: int = 30):
+    subset = usage_df[usage_df['part_id'] == part_id].sort_values('date', ascending=False).head(window_days)
+    if subset.empty:
+        return 0.0, 0.0
+    avg_daily = subset['demand_qty'].mean()
+    sigma = subset['demand_qty'].std(ddof=0)
+    return float(avg_daily), float(sigma if not np.isnan(sigma) else 0.0)
+
+
+def restock_suggestion(avg_daily, sigma_daily, lead_time_days, on_hand, on_order, moq=0, z=1.645, review_period=1):
+    avg_daily = max(0.0, float(avg_daily))
+    sigma_daily = max(0.0, float(sigma_daily))
+    lead_time_days = max(1, int(lead_time_days))
+
+    safety_stock = z * sigma_daily * math.sqrt(lead_time_days)
+    rop = avg_daily * lead_time_days + safety_stock
+    target_stock = avg_daily * (lead_time_days + review_period) + safety_stock
+    shortfall = max(0.0, target_stock - (on_hand + on_order))
+    reorder_qty = max(moq, math.ceil(shortfall)) if shortfall > 0 else 0
+    return {
+        'avg_daily': round(avg_daily,2),
+        'sigma_daily': round(sigma_daily,2),
+        'safety_stock': int(math.ceil(safety_stock)),
+        'ROP': int(math.ceil(rop)),
+        'target_stock': int(math.ceil(target_stock)),
+        'shortfall': int(math.ceil(shortfall)),
+        'reorder_qty': int(reorder_qty)
+    }
+
+# ---------------------------
+# Azure LLM placeholder
+# ---------------------------
+def call_azure_llm_placeholder(prompt_text: str):
+    return "[LLM call placeholder] Replace with Azure API call."
+
+# ---------------------------
+# UI
+# ---------------------------
+
+def main():
+    st.title("📦 Manufacturing Inventory Query & Restock Suggestion Agent")
+
+    # Load dataset
+    inv_df, usage_df, bom_df, schedule_df, suppliers_df, po_df = load_excel_data()
+
+    if inv_df is None:
+        st.stop()
+
+    # Sidebar controls
+    st.sidebar.header("Controls")
+    part_select = st.sidebar.selectbox("Select Part", options=inv_df['part_id'] + ' - ' + inv_df['description'])
+    selected_part_id = part_select.split(' - ')[0]
+    review_window = st.sidebar.slider("Usage window (days)", min_value=7, max_value=60, value=30)
+    service_level = st.sidebar.selectbox("Service level (approx)", options=['90%','95%','99%'])
+    z_map = {'90%':1.282,'95%':1.645,'99%':2.33}
+    z = z_map[service_level]
+
+    # Layout
+    left, right = st.columns([1,1])
+
+    with left:
+        st.subheader("Part Inventory & Usage")
+        part_row = inv_df[inv_df['part_id']==selected_part_id].iloc[0]
+        st.metric("On-hand qty", part_row.on_hand)
+        st.metric("Reorder point", part_row.reorder_point)
+        st.metric("MOQ", part_row.MOQ)
+        st.write("**Supplier:** ", part_row.supplier_id)
+
+        st.markdown("### Recent usage")
+        display_usage = usage_df[usage_df['part_id']==selected_part_id].sort_values('date', ascending=False).head(review_window)
+        st.dataframe(display_usage.reset_index(drop=True))
+
+    with right:
+        st.subheader("Restock Suggestion")
+        avg_daily, sigma_daily = compute_avg_sigma(usage_df, selected_part_id, window_days=review_window)
+        supplier_info = suppliers_df[suppliers_df['supplier_id']==part_row.supplier_id].iloc[0]
+        lead_time = supplier_info['lead_time_days']
+        suggestion = restock_suggestion(avg_daily, sigma_daily, lead_time,
+                                        int(part_row.on_hand), 0,
+                                        moq=int(part_row.MOQ), z=z)
+
+        st.write(f"**Avg daily usage:** {suggestion['avg_daily']} units/day")
+        st.write(f"**Safety stock (z={z}):** {suggestion['safety_stock']} units")
+        st.write(f"**Reorder point (ROP):** {suggestion['ROP']} units")
+        st.write(f"**Target stock:** {suggestion['target_stock']} units")
+
+        if suggestion['shortfall'] > 0:
+            st.error(f"Shortfall: {suggestion['shortfall']} → Suggest reorder {suggestion['reorder_qty']} units")
+        else:
+            st.success("✅ No reorder needed.")
+
+    # Alerts
+    st.markdown("---")
+    st.subheader("Alerts & Issues")
+    alerts = []
+    if part_row.on_hand <= part_row.reorder_point:
+        alerts.append({'severity':'High','message':'Stock is below reorder point!'})
+
+    if alerts:
+        for a in alerts:
+            if a['severity']=='High':
+                st.error(a['message'])
+    else:
+        st.success("No alerts for this part.")
+
+    # Data tables
+    with st.expander("📊 Show Data Tables"):
+        st.write("Inventory")
+        st.dataframe(inv_df.head(20))
+        st.write("Suppliers")
+        st.dataframe(suppliers_df.head(20))
+        st.write("Production Schedule")
+        st.dataframe(schedule_df.head(20))
+        st.write("Purchase Orders")
+        st.dataframe(po_df.head(20))
+
+    # LLM Query
+    st.markdown("---")
+    st.subheader("Conversational Query (LLM placeholder)")
+    user_question = st.text_area("Ask InventoryAI a question")
+    if st.button("Ask InventoryAI"):
+        if not user_question.strip():
+            st.warning("Please type a question.")
+        else:
+            context_text = f"Part: {part_row.part_id} - {part_row.description}\nOn-hand: {part_row.on_hand}, Reorder point: {part_row.reorder_point}, MOQ: {part_row.MOQ}\n"
+            prompt_text = f"Context:\n{context_text}\nQuestion: {user_question}\nAnswer concisely."
+            llm_response = call_azure_llm_placeholder(prompt_text)
+            st.text_area("InventoryAI Response", value=llm_response, height=200)
+
+
+if __name__ == "__main__":
+    main()
