@@ -1,433 +1,118 @@
-# streamlit_inventory_agent_final.py
-# Final Streamlit app: Inventory + Restock + LLM Chat (LangChain primary, REST fallback)
+
 import streamlit as st
 import pandas as pd
-import numpy as np
-import math
 import requests
-import httpx
-from datetime import datetime, timedelta
-from io import BytesIO
-from typing import Tuple, Optional
 
-# Try import LangChain ChatOpenAI; if unavailable, we'll still provide REST fallback.
-try:
-    from langchain_openai import ChatOpenAI
-    LANGCHAIN_AVAILABLE = True
-except Exception:
-    LANGCHAIN_AVAILABLE = False
+# --------------------------
+# CONFIGURATION
+# --------------------------
+EXCEL_FILE = "manufacturing_data.xlsx"
 
-st.set_page_config(page_title="Inventory Query & Restock Agent — Final", layout="wide")
+# 🔧 Hackathon LLM config (fixed in backend)
+BASE_URL = "https://api.deepseek.com/v1"
+MODEL = "deepseek-chat"
+DEEPSEEK_API_KEY = "your_api_key_here"   # Replace with hackathon key
 
-# ---------------------
-# Utilities / Data Load
-# ---------------------
+# --------------------------
+# LOAD DATA
+# --------------------------
 @st.cache_data
-def load_default_excel(path: str = "manufacturing_data.xlsx") -> Tuple[Optional[pd.DataFrame], ...]:
-    try:
-        xls = pd.ExcelFile(path)
-        suppliers = pd.read_excel(xls, sheet_name="Suppliers")
-        inventory = pd.read_excel(xls, sheet_name="Inventory")
-        usage = pd.read_excel(xls, sheet_name="Usage")
-        # make sure usage.date is datetime if present
-        if "date" in usage.columns:
-            usage["date"] = pd.to_datetime(usage["date"], errors="coerce")
-        schedule = pd.read_excel(xls, sheet_name="Schedule")
-        if "date" in schedule.columns:
-            schedule["date"] = pd.to_datetime(schedule["date"], errors="coerce")
-        bom = pd.read_excel(xls, sheet_name="BOM")
-        po = pd.read_excel(xls, sheet_name="PurchaseOrders")
-        return suppliers, inventory, usage, schedule, bom, po
-    except FileNotFoundError:
-        return (None, None, None, None, None, None)
-    except Exception as e:
-        st.error(f"Failed to load default Excel file: {e}")
-        return (None, None, None, None, None, None)
+def load_data(file):
+    xls = pd.ExcelFile(file)
+    data = {sheet: pd.read_excel(xls, sheet) for sheet in xls.sheet_names}
+    return data
 
-@st.cache_data
-def load_excel_bytes(io_bytes: bytes):
-    xls = pd.ExcelFile(BytesIO(io_bytes))
-    suppliers = pd.read_excel(xls, sheet_name="Suppliers")
-    inventory = pd.read_excel(xls, sheet_name="Inventory")
-    usage = pd.read_excel(xls, sheet_name="Usage")
-    if "date" in usage.columns:
-        usage["date"] = pd.to_datetime(usage["date"], errors="coerce")
-    schedule = pd.read_excel(xls, sheet_name="Schedule")
-    if "date" in schedule.columns:
-        schedule["date"] = pd.to_datetime(schedule["date"], errors="coerce")
-    bom = pd.read_excel(xls, sheet_name="BOM")
-    po = pd.read_excel(xls, sheet_name="PurchaseOrders")
-    return suppliers, inventory, usage, schedule, bom, po
-
-# ---------------------
-# Business logic
-# ---------------------
-def compute_avg_sigma(usage_df: pd.DataFrame, part_id: str, window_days: int = 30):
-    if usage_df is None or usage_df.empty:
-        return 0.0, 0.0
-    if "date" in usage_df.columns:
-        subset = usage_df[usage_df["part_id"] == part_id].sort_values("date", ascending=False).head(window_days)
-    else:
-        subset = usage_df[usage_df["part_id"] == part_id].head(window_days)
-    if subset.empty:
-        return 0.0, 0.0
-    qty_col = "demand_qty" if "demand_qty" in subset.columns else ("qty_used" if "qty_used" in subset.columns else subset.columns[-1])
-    avg_daily = subset[qty_col].mean()
-    sigma = subset[qty_col].std(ddof=0)
-    return float(avg_daily), float(sigma if not np.isnan(sigma) else 0.0)
-
-def restock_suggestion(avg_daily, sigma_daily, lead_time_days, on_hand, on_order, moq=0, z=1.645, review_period=1):
-    avg_daily = max(0.0, float(avg_daily))
-    sigma_daily = max(0.0, float(sigma_daily))
-    lead_time_days = max(1, int(lead_time_days))
-    safety_stock = z * sigma_daily * math.sqrt(lead_time_days)
-    rop = avg_daily * lead_time_days + safety_stock
-    target_stock = avg_daily * (lead_time_days + review_period) + safety_stock
-    shortfall = max(0.0, target_stock - (on_hand + on_order))
-    reorder_qty = max(moq, math.ceil(shortfall)) if shortfall > 0 else 0
-    return {
-        "avg_daily": round(avg_daily, 2),
-        "sigma_daily": round(sigma_daily, 2),
-        "safety_stock": int(math.ceil(safety_stock)),
-        "ROP": int(math.ceil(rop)),
-        "target_stock": int(math.ceil(target_stock)),
-        "shortfall": int(math.ceil(shortfall)),
-        "reorder_qty": int(reorder_qty),
+# --------------------------
+# LLM ASK FUNCTION
+# --------------------------
+def ask_llm(question, api_key):
+    url = f"{BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
     }
-
-def parts_below_reorder(inventory_df: pd.DataFrame):
-    if inventory_df is None:
-        return pd.DataFrame()
-    # support both column name styles
-    on_hand_col = "on_hand" if "on_hand" in inventory_df.columns else ("on_hand_qty" if "on_hand_qty" in inventory_df.columns else None)
-    rop_col = "reorder_point" if "reorder_point" in inventory_df.columns else ("safety_stock" if "safety_stock" in inventory_df.columns else None)
-    if not on_hand_col or not rop_col:
-        return pd.DataFrame()
-    return inventory_df[inventory_df[on_hand_col] < inventory_df[rop_col]].copy()
-
-def forecast_demand_simple(usage_df: pd.DataFrame, window_days: int = 30):
-    if usage_df is None or usage_df.empty:
-        return pd.DataFrame(columns=["part_id", "avg_daily_demand"])
-    # detect column name
-    qty_col = "demand_qty" if "demand_qty" in usage_df.columns else ("qty_used" if "qty_used" in usage_df.columns else usage_df.columns[-1])
-    if "date" in usage_df.columns:
-        max_date = usage_df["date"].max()
-        cutoff = max_date - pd.Timedelta(days=window_days)
-        recent = usage_df[usage_df["date"] > cutoff]
-    else:
-        recent = usage_df
-    if recent.empty:
-        return pd.DataFrame(columns=["part_id", "avg_daily_demand"])
-    return recent.groupby("part_id")[qty_col].mean().reset_index(name="avg_daily_demand")
-
-# ---------------------
-# LLM Calls: LangChain primary, REST fallback
-# ---------------------
-def call_llm_langchain(base_url: str, model: str, api_key: str, messages: list, http_client=None):
-    if not LANGCHAIN_AVAILABLE:
-        raise RuntimeError("LangChain ChatOpenAI is not installed/available in this environment.")
-    # use provided http_client or create one
-    client = http_client or httpx.Client()
-    llm = ChatOpenAI(base_url=base_url, model=model, api_key=api_key, http_client=client)
-    # llm.invoke expects messages list of role/content
-    return llm.invoke(messages)  # returns model-specific object; we'll try to extract content
-
-def call_llm_rest(base_url: str, model: str, api_key: str, messages: list, api_version: str = "2023-05-15"):
-    """
-    Generic REST call pattern for Azure-like chat completions.
-    messages: list of {"role":"user"/"system"/...,"content": "..."}
-    """
-    # Support various endpoint shapes: user can provide full endpoint or base URL
-    # We'll try both: (1) base_url + /openai/deployments/{model}/chat/completions and (2) base_url + /v1/chat/completions
-    headers = {"Content-Type": "application/json"}
-    # If using Azure-like key
-    if api_key:
-        # if azure style (api-key header) use 'api-key'
-        headers["api-key"] = api_key
-        auth_header = None
-    else:
-        auth_header = None
-
     payload = {
-        "messages": messages,
-        "max_tokens": 512,
-        "temperature": 0.1,
-        "model": model
+        "model": MODEL,
+        "messages": [{"role": "user", "content": question}],
+        "temperature": 0.7
     }
 
-    # Try Azure-style deployments endpoint first (common for on-prem/azure)
     try:
-        azure_url = f"{base_url.rstrip('/')}/openai/deployments/{model}/chat/completions?api-version={api_version}"
-        r = requests.post(azure_url, headers=headers, json=payload, timeout=30)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-
-    # Try generic OpenAI-compatible endpoint
-    try:
-        generic_url = f"{base_url.rstrip('/')}/v1/chat/completions"
-        headers2 = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload2 = {"model": model, "messages": messages, "max_tokens": 512, "temperature": 0.1}
-        r2 = requests.post(generic_url, headers=headers2, json=payload2, timeout=30)
-        r2.raise_for_status()
-        return r2.json()
+        response = requests.post(url, headers=headers, json=payload, timeout=30, verify=False)  # 👈 ignore SSL certs
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"], data
     except Exception as e:
-        # bubble up last error
-        raise RuntimeError(f"REST LLM call failed: {e}")
+        return f"❌ Error: {e}", None
 
-def llm_request_with_fallback(base_url: str, model: str, api_key: str, messages: list):
-    debug = {"method_tried": [], "errors": []}
-    # Try LangChain first
-    if LANGCHAIN_AVAILABLE:
-        try:
-            debug["method_tried"].append("langchain")
-            resp_obj = call_llm_langchain(base_url, model, api_key, messages)
-            # attempt to extract text content robustly
-            try:
-                # many langchain wrappers return object with .content or .generations
-                if hasattr(resp_obj, "content"):
-                    return {"text": resp_obj.content, "debug": debug}
-                elif isinstance(resp_obj, dict):
-                    # maybe an already parsed dict
-                    choices = resp_obj.get("choices")
-                    if choices and isinstance(choices, list):
-                        return {"text": choices[0]["message"]["content"], "debug": debug}
-                    return {"text": str(resp_obj), "debug": debug}
-                else:
-                    return {"text": str(resp_obj), "debug": debug}
-            except Exception as e:
-                debug["errors"].append(f"langchain_extract_error: {e}")
-        except Exception as e:
-            debug["errors"].append(f"langchain_error: {e}")
+# --------------------------
+# STREAMLIT UI
+# --------------------------
+st.set_page_config(page_title="Manufacturing Inventory Agent", layout="wide")
+st.title("🏭 Manufacturing Inventory Query & Restock Suggestion Agent")
 
-    # Fallback to REST
-    try:
-        debug["method_tried"].append("rest")
-        rest_resp = call_llm_rest(base_url, model, api_key, messages)
-        # parse usual response shapes
-        if isinstance(rest_resp, dict):
-            choices = rest_resp.get("choices")
-            if choices and isinstance(choices, list):
-                text = choices[0].get("message", {}).get("content") or choices[0].get("text") or str(choices[0])
-                return {"text": text, "debug": debug, "raw": rest_resp}
-            # azure: choices[0]["message"]["content"]
-            return {"text": str(rest_resp), "debug": debug, "raw": rest_resp}
-        else:
-            return {"text": str(rest_resp), "debug": debug}
-    except Exception as e:
-        debug["errors"].append(f"rest_error: {e}")
-        return {"text": None, "debug": debug, "errors": debug["errors"]}
-
-# ---------------------
-# UI: data upload / load
-# ---------------------
-st.title("Manufacturing Inventory Query & Restock Suggestion Agent — Final")
-
-st.sidebar.header("Data & LLM Config")
-uploaded = st.sidebar.file_uploader("Upload manufacturing_data.xlsx (optional)", type=["xlsx"])
-
-if uploaded:
-    try:
-        suppliers_df, inv_df, usage_df, schedule_df, bom_df, po_df = load_excel_bytes(uploaded.read())
-        st.sidebar.success("Uploaded file loaded.")
-    except Exception as e:
-        st.sidebar.error(f"Failed to read uploaded file: {e}")
-        suppliers_df = inv_df = usage_df = schedule_df = bom_df = po_df = None
-else:
-    suppliers_df, inv_df, usage_df, schedule_df, bom_df, po_df = load_default_excel()
-
-if inv_df is None:
-    st.error("No dataset available. Upload manufacturing_data.xlsx in the sidebar or place it in app folder.")
+# Load data
+try:
+    data = load_data(EXCEL_FILE)
+    st.sidebar.success("✅ Data loaded successfully")
+except Exception as e:
+    st.sidebar.error(f"❌ Error loading data: {e}")
     st.stop()
 
-# LLM credentials (enter in sidebar)
-st.sidebar.markdown("### LLM / Model settings")
-llm_base_url = st.sidebar.text_input("LLM Base URL (e.g. https://genailab.tcs.in/)", value="")
-llm_model = st.sidebar.text_input("LLM model / deployment name", value="")
-llm_api_key = st.sidebar.text_input("LLM API key", type="password", value="")
+# Sidebar navigation
+st.sidebar.header("Navigation")
+page = st.sidebar.radio("Go to:", ["Inventory Dashboard", "Ask LLM"])
 
-# Page selector
-page = st.sidebar.selectbox("Page", ["Dashboard", "Inventory Lookup", "Shortages", "Forecast & Risk", "Chat (LLM)"])
+# --------------------------
+# INVENTORY DASHBOARD
+# --------------------------
+if page == "Inventory Dashboard":
+    st.header("📊 Inventory Dashboard")
 
-# ---------------------
-# Dashboard
-# ---------------------
-if page == "Dashboard":
-    st.header("Quick KPIs")
-    on_hand_col = "on_hand" if "on_hand" in inv_df.columns else "on_hand_qty" if "on_hand_qty" in inv_df.columns else None
-    parts_count = inv_df["part_id"].nunique()
-    suppliers_count = suppliers_df["supplier_id"].nunique() if suppliers_df is not None else 0
-    st.metric("Parts", parts_count)
-    st.metric("Suppliers", suppliers_count)
-    st.metric("Usage records", len(usage_df) if usage_df is not None else 0)
-    st.markdown("Inventory sample")
-    st.dataframe(inv_df.head(50))
+    if "Inventory" in data:
+        st.subheader("Current Inventory")
+        st.dataframe(data["Inventory"].head(20))
 
-# ---------------------
-# Inventory Lookup
-# ---------------------
-elif page == "Inventory Lookup":
-    st.header("Inventory Lookup & Restock Suggestion")
-    # display part selector with description if present
-    display_options = inv_df["part_id"] + " - " + (inv_df["description"].astype(str) if "description" in inv_df.columns else (inv_df["part_name"].astype(str) if "part_name" in inv_df.columns else inv_df["part_id"]))
-    selected = st.selectbox("Choose part", options=display_options)
-    part_id = selected.split(" - ")[0]
-    review_window = st.slider("Usage window (days) for stats", 7, 90, 30)
-    service_level = st.selectbox("Service level", ["90%","95%","99%"])
-    z_map = {"90%":1.282, "95%":1.645, "99%":2.33}
-    z = z_map[service_level]
+        low_stock = data["Inventory"][data["Inventory"]["StockQuantity"] < 50]
+        if not low_stock.empty:
+            st.warning("⚠️ Low Stock Items:")
+            st.dataframe(low_stock)
 
-    part_row = inv_df[inv_df["part_id"] == part_id].iloc[0]
-    # unify columns
-    on_hand = int(part_row.get("on_hand", part_row.get("on_hand_qty", 0)))
-    on_order = int(part_row.get("on_order", part_row.get("on_order_qty", 0)))
-    moq = int(part_row.get("MOQ", part_row.get("moq", 0)))
-    st.write(f"**Part:** {part_row['part_id']} — {part_row.get('description', part_row.get('part_name','-'))}")
-    st.write("Supplier:", part_row.get("supplier_id","-"))
-    st.metric("On hand", on_hand)
-    st.metric("On order", on_order)
-    st.metric("MOQ", moq)
+    if "Usage" in data:
+        st.subheader("Historical Usage Trends")
+        usage_summary = data["Usage"].groupby("PartID")["QuantityUsed"].sum().reset_index()
+        st.bar_chart(usage_summary.set_index("PartID"))
 
-    avg_daily, sigma_daily = compute_avg_sigma(usage_df, part_id, window_days=review_window)
-    # supplier lead time lookup
-    supplier_lt = 7
-    if suppliers_df is not None and "supplier_id" in part_row.index:
-        s = suppliers_df[suppliers_df["supplier_id"] == part_row.get("supplier_id")]
-        if not s.empty:
-            supplier_lt = int(s.iloc[0].get("lead_time_days", s.iloc[0].get("avg_lead_time_days", 7)))
-    suggestion = restock_suggestion(avg_daily, sigma_daily, supplier_lt, on_hand, on_order, moq=moq, z=z)
-    st.write(f"Avg daily usage: **{suggestion['avg_daily']}**")
-    st.write(f"Sigma daily usage: **{suggestion['sigma_daily']}**")
-    st.write(f"Safety stock: **{suggestion['safety_stock']}**")
-    st.write(f"Reorder point (ROP): **{suggestion['ROP']}**")
-    st.write(f"Target stock: **{suggestion['target_stock']}**")
-    if suggestion["shortfall"] > 0:
-        st.error(f"Shortfall: {suggestion['shortfall']} → Suggest reorder qty: {suggestion['reorder_qty']}")
-    else:
-        st.success("No reorder required.")
+    if "PurchaseOrders" in data:
+        st.subheader("Recent Purchase Orders")
+        st.dataframe(data["PurchaseOrders"].tail(10))
 
-    # future requirement via BOM+schedule (simple)
-    if bom_df is not None and schedule_df is not None:
-        try:
-            # get upcoming schedule days (next 7 days relative to schedule max)
-            if "date" in schedule_df.columns:
-                today = schedule_df["date"].max()
-                cutoff = today + pd.Timedelta(days=7)
-                upcoming = schedule_df[(schedule_df["date"]> today) & (schedule_df["date"]<= cutoff)]
-                planned_by_model = upcoming.groupby("car_model")["planned_qty"].sum().reset_index()
-                bom_for_part = bom_df[bom_df["part_id"] == part_id]
-                req = 0
-                if not bom_for_part.empty:
-                    merged = planned_by_model.merge(bom_for_part, on="car_model", how="left")
-                    if not merged.empty:
-                        merged["required"] = merged["planned_qty"] * merged["qty_per_car"]
-                        req = int(merged["required"].sum())
-                st.write(f"Estimated requirement for next 7 days by production (BOM): **{req}**")
-            else:
-                st.info("Schedule has no date column; cannot compute future requirement.")
-        except Exception as e:
-            st.info(f"Could not compute BOM+Schedule requirement: {e}")
+# --------------------------
+# LLM Q&A SECTION
+# --------------------------
+elif page == "Ask LLM":
+    st.header("🔮 Ask the LLM about Manufacturing Data")
 
-# ---------------------
-# Shortages
-# ---------------------
-elif page == "Shortages":
-    st.header("Parts Below Reorder Point")
-    shortages = parts_below_reorder(inv_df)
-    st.write(f"{len(shortages)} parts below reorder point.")
-    if not shortages.empty:
-        st.dataframe(shortages.sort_values(by=shortages.columns[0]).reset_index(drop=True))
-    else:
-        st.write("No shortages detected or inventory columns not standard.")
+    user_q = st.text_area("Type your question:",
+                          placeholder="e.g., Which parts are at risk of stockout next week?")
 
-# ---------------------
-# Forecast & Risk
-# ---------------------
-elif page == "Forecast & Risk":
-    st.header("Demand Forecast (simple avg) & 7-day stockout risk")
-    window_days = st.slider("Window for demand average (days)", 7, 90, 30)
-    forecast_df = forecast_demand_simple(usage_df, window_days=window_days)
-    st.subheader("Average daily demand (sample)")
-    st.dataframe(forecast_df.sort_values("avg_daily_demand", ascending=False).head(50))
-
-    st.subheader("Parts at risk (7 days)")
-    merged = inv_df.merge(forecast_df, on="part_id", how="left").fillna(0)
-    merged["expected_demand_7d"] = merged["avg_daily_demand"] * 7
-    on_hand_col = "on_hand" if "on_hand" in merged.columns else ("on_hand_qty" if "on_hand_qty" in merged.columns else None)
-    if on_hand_col:
-        risk_df = merged[merged[on_hand_col] < merged["expected_demand_7d"]][["part_id", on_hand_col, "expected_demand_7d"]]
-        st.dataframe(risk_df.sort_values("expected_demand_7d", ascending=False).head(50))
-    else:
-        st.info("Inventory on-hand column not found (expected 'on_hand' or 'on_hand_qty').")
-
-# ---------------------
-# Chat (LLM)
-# ---------------------
-elif page == "Chat (LLM)":
-    st.header("Conversational Inventory Agent (LLM)")
-
-    st.markdown("**Quick queries** — click to populate the question box")
-    c1, c2, c3 = st.columns(3)
-    if c1.button("Which suppliers cause most shortages?"):
-        q_text = "Which suppliers are causing the most shortages? Provide top 5 suppliers and suggested actions."
-        st.session_state["query_text"] = q_text
-    if c2.button("Which parts will stock out in 7 days?"):
-        q_text = "Which parts are likely to stock out within the next 7 days? Show part_id and shortfall."
-        st.session_state["query_text"] = q_text
-    if c3.button("Suggest restock plan for urgent parts"):
-        q_text = "Based on current shortages, suggest a prioritized restock plan with quantities and supplier recommendations."
-        st.session_state["query_text"] = q_text
-
-    query_text = st.text_area("Question for InventoryAI", value=st.session_state.get("query_text",""), height=160)
-
-    st.markdown("**LLM connection settings (sidebar)** — provide base_url, model name/deployment and API key above before Ask.")
-    if st.button("Ask InventoryAI"):
-        if not query_text.strip():
-            st.warning("Enter a question (or use Quick queries).")
-        elif not (llm_base_url and llm_model and llm_api_key):
-            st.warning("Please supply LLM Base URL, Model/Deployment name and API key in sidebar to enable calls.")
+    if st.button("Ask LLM"):
+        if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.startswith("your_"):
+            st.error("⚠️ Please set a valid DEEPSEEK_API_KEY in code.")
         else:
-            # Build concise numeric context (small) to send to LLM
-            shortages = parts_below_reorder(inv_df)
-            shortages_small = shortages.head(10).to_dict(orient="records")
-            forecast = forecast_demand_simple(usage_df, window_days=30)
-            top_forecast = forecast.sort_values("avg_daily_demand", ascending=False).head(10).to_dict(orient="records")
-            supplier_sample = suppliers_df.head(10).to_dict(orient="records")
+            answer, raw = ask_llm(user_q, DEEPSEEK_API_KEY)
+            st.success(answer)
 
-            # Compose user prompt: short JSON-like facts + question
-            context = {
-                "shortages_sample": shortages_small,
-                "top_demand_sample": top_forecast,
-                "supplier_sample": supplier_sample
-            }
-            prompt = (
-                "You are InventoryAI, an assistant for a car manufacturing plant. "
-                "Use ONLY the factual numeric context provided below. Do not invent numbers.\n\n"
-                f"Context (JSON):\n{context}\n\n"
-                f"User question:\n{query_text}\n\n"
-                "Answer concisely, list key numbers used, and give 1-2 concrete recommendations."
-            )
+            with st.expander("🔎 Debug: Raw API Response"):
+                st.json(raw)
 
-            messages = [
-                {"role": "system", "content": "You are a helpful manufacturing inventory assistant."},
-                {"role": "user", "content": prompt}
-            ]
-
-            # Call LLM via LangChain or REST fallback and show debug info
-            with st.spinner("Calling LLM..."):
-                result = llm_request_with_fallback(llm_base_url, llm_model, llm_api_key, messages)
-                if result.get("text"):
-                    st.subheader("LLM Answer")
-                    st.write(result["text"])
-                else:
-                    st.error("LLM call failed. See debug below.")
-                with st.expander("🔍 Debug (methods tried & raw)"):
-                    st.json(result.get("debug", {}))
-                    if "raw" in result:
-                        st.write("Raw response (truncated):")
-                        st.write(result["raw"])
-
-# Footer
-st.markdown("---")
-st.caption("Notes: Provide correct LLM base URL, deployment/model and API key in the sidebar. LangChain usage is attempted first; fallback to REST is automatic. Ensure network access to the model endpoint from your environment.")
+    st.subheader("Quick Ask")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Which items need restocking soon?"):
+            answer, _ = ask_llm("Which items need restocking soon?", DEEPSEEK_API_KEY)
+            st.info(answer)
+    with col2:
+        if st.button("Suggest suppliers for critical parts"):
+            answer, _ = ask_llm("Suggest suppliers for critical parts", DEEPSEEK_API_KEY)
+            st.info(answer)
